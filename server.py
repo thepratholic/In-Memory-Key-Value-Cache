@@ -7,7 +7,8 @@ from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import JSONResponse as ORJSONResponse
+
 from pydantic import BaseModel, field_validator
 
 
@@ -270,9 +271,5 @@ if __name__ == "__main__":
         "server:app",
         host=HOST,
         port=PORT,
-        workers=os.cpu_count(),       # one worker per CPU core
-        loop="uvloop",                # fastest asyncio event loop
-        http="httptools",             # fastest HTTP parser
-        log_level="warning",          # reduce logging overhead
-        access_log=False,             # disable access log for speed
+        log_level="info",
     )
