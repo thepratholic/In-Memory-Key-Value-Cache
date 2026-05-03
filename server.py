@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse as ORJSONResponse
 
 from pydantic import BaseModel, field_validator
