@@ -156,7 +156,7 @@ class ShardedCache:
     def _shard(self, key: str) -> CacheShard:
         return self._shards[djb2_hash(key) & self._mask]
 
-    def put(self, key: str, value: str) -> None:
+    def put(self, key: str, value: str) -> None: # delegation pattern
         self._shard(key).put(key, value)
 
     def get(self, key: str) -> Optional[str]:
