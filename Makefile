@@ -1,48 +1,74 @@
-.PHONY: install run test docker-build docker-up docker-down smoke-test clean
+# ─── Makefile ─────────────────────────────────────────────────────────────────
+# Commonly used commands — shortcuts taaki baar baar long commands na likhne padein.
+#
+# Usage:
+#   make install     → dependencies install karo
+#   make run         → server locally start karo
+#   make test        → tests chalaao
+#   make docker-build → Docker image banao
+#   make docker-run  → Docker container start karo
+#   make clean       → cache/temp files hataao
+# ──────────────────────────────────────────────────────────────────────────────
 
-PORT ?= 7171
+# Variables
+IMAGE_NAME  = kvcache
+SERVER_PORT = 7171
+PYTHON      = python3
+
+.PHONY: install run test docker-build docker-run docker-stop clean help
+
+
+# ── Default: help dikhao ──────────────────────────────────────────────────────
+
+help:
+	@echo ""
+	@echo "  In-Memory KV Cache — Available Commands"
+	@echo "  ──────────────────────────────────────────"
+	@echo "  make install       Install Python dependencies"
+	@echo "  make run           Start server locally (port $(SERVER_PORT))"
+	@echo "  make test          Run test suite (server must be running)"
+	@echo "  make docker-build  Build Docker image"
+	@echo "  make docker-run    Run server in Docker container"
+	@echo "  make docker-stop   Stop running Docker container"
+	@echo "  make clean         Remove cache and temp files"
+	@echo ""
+
+
+# ── Local Development ─────────────────────────────────────────────────────────
 
 install:
+	@echo "→ Installing dependencies..."
 	pip install -r requirements.txt
 
 run:
-	python server.py
-
-# Run with a single worker (useful for debugging)
-run-dev:
-	uvicorn server:app --host 0.0.0.0 --port $(PORT) --reload --log-level info
+	@echo "→ Starting server on http://localhost:$(SERVER_PORT)"
+	@echo "   Press Ctrl+C to stop."
+	$(PYTHON) server.py
 
 test:
-	pytest test_server.py -v
+	@echo "→ Running tests (make sure server is running first)..."
+	$(PYTHON) test_server.py
+
+
+# ── Docker ────────────────────────────────────────────────────────────────────
 
 docker-build:
-	docker build -t kv-cache-python:latest .
+	@echo "→ Building Docker image '$(IMAGE_NAME)'..."
+	docker build -t $(IMAGE_NAME) .
 
-docker-up:
-	docker run -d \
-		--name kv-cache-python \
-		-p $(PORT):7171 \
-		--ulimit nofile=1048576:1048576 \
-		--restart=unless-stopped \
-		kv-cache-python:latest
+docker-run: docker-build
+	@echo "→ Starting container on http://localhost:$(SERVER_PORT)"
+	docker run --rm -p $(SERVER_PORT):$(SERVER_PORT) --name $(IMAGE_NAME) $(IMAGE_NAME)
 
-docker-down:
-	docker stop kv-cache-python && docker rm kv-cache-python
+docker-stop:
+	@echo "→ Stopping container '$(IMAGE_NAME)'..."
+	docker stop $(IMAGE_NAME) || true
 
-smoke-test:
-	@echo "==> PUT"
-	curl -s -X POST http://localhost:$(PORT)/put \
-		-H "Content-Type: application/json" \
-		-d '{"key":"hello","value":"world"}' | python -m json.tool
-	@echo "==> GET"
-	curl -s "http://localhost:$(PORT)/get?key=hello" | python -m json.tool
-	@echo "==> DELETE"
-	curl -s -X DELETE "http://localhost:$(PORT)/delete?key=hello" | python -m json.tool
-	@echo "==> STATS"
-	curl -s "http://localhost:$(PORT)/stats" | python -m json.tool
-	@echo "==> HEALTH"
-	curl -s "http://localhost:$(PORT)/health" | python -m json.tool
+
+# ── Cleanup ───────────────────────────────────────────────────────────────────
 
 clean:
-	find . -type d -name __pycache__ -exec rm -rf {} +
-	find . -name "*.pyc" -delete
+	@echo "→ Cleaning up..."
+	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	find . -name "*.pyc" -delete 2>/dev/null || true
+	@echo "   Done."
