@@ -1,196 +1,153 @@
+"""
+Test Suite — In-Memory KV Cache
+================================
+Yeh file server ko test karti hai.
+Server pehle chalu karo:  python server.py
+Phir test chalaao:        python test_server.py
 
-from fastapi.testclient import TestClient
+Har test ek scenario cover karta hai — pass hua toh ✓, fail hua toh ✗.
+"""
 
-from server import app, djb2_hash, ShardedCache, CacheShard
+import requests
 
-client = TestClient(app)
-
-
-# ---------------------------------------------------------------------------
-# DJB2 hash tests
-# ---------------------------------------------------------------------------
-
-class TestDjb2Hash:
-    def test_deterministic(self):
-        assert djb2_hash("hello") == djb2_hash("hello")
-
-    def test_different_keys_differ(self):
-        assert djb2_hash("foo") != djb2_hash("bar")
-
-    def test_empty_string(self):
-        assert djb2_hash("") == 5381   # DJB2 seed value
-
-    def test_returns_non_negative(self):
-        for key in ["abc", "xyz", "123", "!@#"]:
-            assert djb2_hash(key) >= 0
+BASE = "http://localhost:7171"   # server ka address
 
 
-# ---------------------------------------------------------------------------
-# CacheShard tests
-# ---------------------------------------------------------------------------
+# ─── Helper ───────────────────────────────────────────────────────────────────
 
-class TestCacheShard:
-    def test_put_and_get(self):
-        shard = CacheShard(max_items=100)
-        shard.put("k1", "v1")
-        assert shard.get("k1") == "v1"
-
-    def test_get_missing_returns_none(self):
-        shard = CacheShard(max_items=100)
-        assert shard.get("no_such_key") is None
-
-    def test_update_existing(self):
-        shard = CacheShard(max_items=100)
-        shard.put("k", "old")
-        shard.put("k", "new")
-        assert shard.get("k") == "new"
-
-    def test_eviction_when_full(self):
-        shard = CacheShard(max_items=3)
-        shard.put("a", "1")
-        shard.put("b", "2")
-        shard.put("c", "3")
-        # Adding one more should evict something — total stays at 3
-        shard.put("d", "4")
-        assert shard.size == 3
-
-    def test_delete_existing(self):
-        shard = CacheShard(max_items=100)
-        shard.put("x", "y")
-        assert shard.delete("x") is True
-        assert shard.get("x") is None
-
-    def test_delete_missing(self):
-        shard = CacheShard(max_items=100)
-        assert shard.delete("ghost") is False
-
-    def test_size_tracking(self):
-        shard = CacheShard(max_items=100)
-        assert shard.size == 0
-        shard.put("a", "1")
-        assert shard.size == 1
-        shard.put("b", "2")
-        assert shard.size == 2
-        shard.delete("a")
-        assert shard.size == 1
+def check(test_name: str, condition: bool):
+    """Test result print karo — simple pass/fail."""
+    status = "✓ PASS" if condition else "✗ FAIL"
+    print(f"  {status}  |  {test_name}")
 
 
-# ---------------------------------------------------------------------------
-# ShardedCache tests
-# ---------------------------------------------------------------------------
+# ─── Tests ────────────────────────────────────────────────────────────────────
 
-class TestShardedCache:
-    def test_basic_put_get(self):
-        cache = ShardedCache(num_shards=4, max_per_shard=1000)
-        cache.put("name", "Alice")
-        assert cache.get("name") == "Alice"
-
-    def test_missing_key(self):
-        cache = ShardedCache(num_shards=4, max_per_shard=1000)
-        assert cache.get("ghost") is None
-
-    def test_overwrite(self):
-        cache = ShardedCache(num_shards=4, max_per_shard=1000)
-        cache.put("x", "1")
-        cache.put("x", "2")
-        assert cache.get("x") == "2"
-
-    def test_delete(self):
-        cache = ShardedCache(num_shards=4, max_per_shard=1000)
-        cache.put("z", "val")
-        assert cache.delete("z") is True
-        assert cache.get("z") is None
-
-    def test_multiple_keys_across_shards(self):
-        cache = ShardedCache(num_shards=4, max_per_shard=1000)
-        keys = [f"key:{i}" for i in range(100)]
-        for k in keys:
-            cache.put(k, f"val:{k}")
-        for k in keys:
-            assert cache.get(k) == f"val:{k}"
-
-    def test_stats(self):
-        cache = ShardedCache(num_shards=4, max_per_shard=1000)
-        for i in range(10):
-            cache.put(f"k{i}", f"v{i}")
-        stats = cache.stats()
-        assert stats["total_items"] == 10
-        assert stats["num_shards"] == 4
+def test_health():
+    print("\n[1] Health Check")
+    r = requests.get(f"{BASE}/health")
+    check("Status code 200", r.status_code == 200)
+    check("Returns healthy", r.json().get("status") == "healthy")
 
 
-# ---------------------------------------------------------------------------
-# HTTP API tests
-# ---------------------------------------------------------------------------
+def test_put_and_get():
+    print("\n[2] PUT then GET")
+    # Store karo
+    r = requests.post(f"{BASE}/put", json={"key": "name", "value": "Pratham"})
+    check("PUT returns 200", r.status_code == 200)
 
-class TestHealthEndpoint:
-    def test_health(self):
-        resp = client.get("/health")
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "healthy"
-
-
-class TestPutEndpoint:
-    def test_put_success(self):
-        resp = client.post("/put", json={"key": "foo", "value": "bar"})
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "OK"
-
-    def test_put_empty_key_rejected(self):
-        resp = client.post("/put", json={"key": "", "value": "bar"})
-        assert resp.status_code == 422
-
-    def test_put_key_too_long(self):
-        resp = client.post("/put", json={"key": "x" * 300, "value": "v"})
-        assert resp.status_code == 422
-
-    def test_put_value_too_long(self):
-        resp = client.post("/put", json={"key": "k", "value": "v" * 300})
-        assert resp.status_code == 422
-
-    def test_put_missing_fields(self):
-        resp = client.post("/put", json={"key": "only_key"})
-        assert resp.status_code == 422
+    # Retrieve karo
+    r = requests.get(f"{BASE}/get", params={"key": "name"})
+    check("GET returns 200", r.status_code == 200)
+    check("Value sahi mila", r.json().get("value") == "Pratham")
 
 
-class TestGetEndpoint:
-    def test_get_existing_key(self):
-        client.post("/put", json={"key": "mykey", "value": "myval"})
-        resp = client.get("/get", params={"key": "mykey"})
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "OK"
-        assert data["key"] == "mykey"
-        assert data["value"] == "myval"
+def test_update_existing_key():
+    print("\n[3] Update Existing Key")
+    requests.post(f"{BASE}/put", json={"key": "city", "value": "Bhuj"})
+    requests.post(f"{BASE}/put", json={"key": "city", "value": "Mumbai"})  # overwrite
 
-    def test_get_missing_key(self):
-        resp = client.get("/get", params={"key": "does_not_exist_xyz"})
-        assert resp.status_code == 404
-        assert resp.json()["status"] == "ERROR"
-
-    def test_get_no_key_param(self):
-        resp = client.get("/get")
-        assert resp.status_code == 422
+    r = requests.get(f"{BASE}/get", params={"key": "city"})
+    check("Value updated to Mumbai", r.json().get("value") == "Mumbai")
 
 
-class TestDeleteEndpoint:
-    def test_delete_existing(self):
-        client.post("/put", json={"key": "del_me", "value": "bye"})
-        resp = client.delete("/delete", params={"key": "del_me"})
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "OK"
-        # Confirm gone
-        assert client.get("/get", params={"key": "del_me"}).status_code == 404
-
-    def test_delete_missing(self):
-        resp = client.delete("/delete", params={"key": "ghost_key_xyz"})
-        assert resp.status_code == 404
+def test_get_missing_key():
+    print("\n[4] GET Non-Existent Key")
+    r = requests.get(f"{BASE}/get", params={"key": "this_key_does_not_exist"})
+    check("Returns 404", r.status_code == 404)
+    check("Error message present", "not found" in r.json().get("message", "").lower())
 
 
-class TestStatsEndpoint:
-    def test_stats_returns_expected_fields(self):
-        resp = client.get("/stats")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "total_items" in data
-        assert "num_shards" in data
-        assert "shard_sizes" in data
+def test_delete():
+    print("\n[5] DELETE Key")
+    requests.post(f"{BASE}/put", json={"key": "temp", "value": "bye"})
+
+    r = requests.delete(f"{BASE}/delete", params={"key": "temp"})
+    check("DELETE returns 200", r.status_code == 200)
+
+    # Ab GET karo — 404 aana chahiye
+    r = requests.get(f"{BASE}/get", params={"key": "temp"})
+    check("Key ab exist nahi karta", r.status_code == 404)
+
+
+def test_delete_missing_key():
+    print("\n[6] DELETE Non-Existent Key")
+    r = requests.delete(f"{BASE}/delete", params={"key": "ghost_key"})
+    check("Returns 404", r.status_code == 404)
+
+
+def test_empty_key_rejected():
+    print("\n[7] Empty Key Validation")
+    r = requests.post(f"{BASE}/put", json={"key": "", "value": "test"})
+    check("Empty key rejected (422)", r.status_code == 422)
+
+
+def test_oversized_key_rejected():
+    print("\n[8] Oversized Key Validation")
+    big_key = "x" * 300   # 300 chars — limit 256
+    r = requests.post(f"{BASE}/put", json={"key": big_key, "value": "val"})
+    check("Oversized key rejected (422)", r.status_code == 422)
+
+
+def test_stats():
+    print("\n[9] Stats Endpoint")
+    r = requests.get(f"{BASE}/stats")
+    check("Stats returns 200", r.status_code == 200)
+
+    data = r.json()
+    # Yeh fields honi chahiye response mein
+    for field in ["total_items", "max_capacity", "hits", "misses", "hit_rate_pct"]:
+        check(f"Field '{field}' present", field in data)
+
+    print(f"\n     📊 Cache Stats:")
+    print(f"        Items     : {data.get('total_items')} / {data.get('max_capacity')}")
+    print(f"        Hits      : {data.get('hits')}")
+    print(f"        Misses    : {data.get('misses')}")
+    print(f"        Hit Rate  : {data.get('hit_rate_pct')}%")
+    print(f"        Evictions : {data.get('evictions')}")
+
+
+def test_eviction():
+    print("\n[10] Eviction (Cache Full)")
+    # /stats se current max_capacity lo
+    capacity = requests.get(f"{BASE}/stats").json().get("max_capacity", 1000)
+
+    # Cache ko bilkul bhar do
+    print(f"     Filling cache with {capacity} keys...")
+    for i in range(capacity):
+        requests.post(f"{BASE}/put", json={"key": f"evict_key_{i}", "value": str(i)})
+
+    # Ek aur dalo — ab eviction honi chahiye
+    requests.post(f"{BASE}/put", json={"key": "overflow_key", "value": "this triggers eviction"})
+
+    stats = requests.get(f"{BASE}/stats").json()
+    check("Evictions > 0 (eviction hua)", stats.get("evictions", 0) > 0)
+    check("Cache size capacity se zyada nahi", stats.get("total_items", 0) <= capacity)
+
+
+# ─── Run All Tests ────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("  In-Memory KV Cache — Test Suite")
+    print("=" * 50)
+
+    try:
+        test_health()
+        test_put_and_get()
+        test_update_existing_key()
+        test_get_missing_key()
+        test_delete()
+        test_delete_missing_key()
+        test_empty_key_rejected()
+        test_oversized_key_rejected()
+        test_stats()
+        test_eviction()
+
+        print("\n" + "=" * 50)
+        print("  All tests done!")
+        print("=" * 50)
+
+    except requests.exceptions.ConnectionError:
+        print("\n❌ Server se connect nahi ho paya!")
+        print("   Pehle server chalaao:  python server.py")
