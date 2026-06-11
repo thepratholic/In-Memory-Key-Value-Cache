@@ -1,15 +1,16 @@
 # In-Memory Key-Value Cache
 
-A Redis-like in-memory cache built from scratch in Python — featuring a REST API, FIFO eviction, thread safety, and Docker support.
+A Redis-like in-memory cache built from scratch in Python — featuring a sharded architecture, custom Readers-Writer lock, REST API, FIFO eviction, and Docker support.
 
 ---
 
 ## What Problem Does This Solve?
 
-Every time a user requests data, your app queries the database. If 1000 users request the same data, that's 1000 database hits — slow and expensive.
+Every time a user requests data, your app queries the database. If 1000 users request the same profile page, that's 1000 database hits — slow and expensive.
 
 ```
-Without Cache:  Request → Database (every single time) ❌
+Without Cache:  Request → Database (every time) ❌
+
 With Cache:     Request → Cache HIT  → instant response ✅
                 Request → Cache MISS → Database → store in Cache → response
 ```
@@ -20,11 +21,12 @@ This project implements that cache layer — the same idea behind Redis and Memc
 
 ## Features
 
+- **Sharded Architecture** — 16 independent cache shards for parallel access
+- **DJB2 Hashing** — consistent key-to-shard routing using bitmask (faster than modulo)
+- **Custom RWLock** — multiple threads can read simultaneously; writes are exclusive
+- **FIFO Eviction** — oldest key removed automatically when a shard hits capacity
 - **PUT / GET / DELETE** — core key-value operations via HTTP
-- **FIFO Eviction** — when cache is full, oldest key is removed automatically
-- **Thread Safety** — `threading.Lock()` ensures safe concurrent access
-- **Stats Endpoint** — tracks hits, misses, evictions, and hit rate %
-- **Input Validation** — empty keys and oversized values are rejected
+- **Input Validation** — empty keys and oversized values rejected (Pydantic)
 - **Dockerized** — runs anywhere with a single command
 
 ---
@@ -34,7 +36,8 @@ This project implements that cache layer — the same idea behind Redis and Memc
 ```
 .
 ├── server.py          # Core cache logic + FastAPI HTTP server
-├── test_server.py     # Test suite (run after starting server)
+├── test_server.py     # Test suite
+├── metrics.py         # Benchmark script
 ├── Dockerfile         # Container definition
 ├── requirements.txt   # Python dependencies
 ├── Makefile           # Shortcuts for common commands
@@ -45,104 +48,78 @@ This project implements that cache layer — the same idea behind Redis and Memc
 
 ## Quickstart
 
-### Option 1 — Run Locally
+### Run Locally
 
 ```bash
-# 1. Install dependencies
 pip install -r requirements.txt
-
-# 2. Start the server
 python server.py
-
-# 3. Server is live at http://localhost:7171
+# Server live at http://localhost:7171
 ```
 
-### Option 2 — Run with Docker
+### Run with Docker
 
 ```bash
-# Build the image
 docker build -t kvcache .
-
-# Run the container
 docker run -p 7171:7171 kvcache
 ```
 
-### Option 3 — Use Make (easiest)
+### Use Make
 
 ```bash
-make run        # start server locally
-make docker-run # start with Docker
-make test       # run all tests
+make install      # install dependencies
+make run          # start server
+make test         # run tests
+make docker-run   # build + run in Docker
 ```
 
 ---
 
 ## API Reference
 
-### `POST /put` — Store a key-value pair
-
+### `POST /put`
 ```bash
 curl -X POST http://localhost:7171/put \
   -H "Content-Type: application/json" \
   -d '{"key": "username", "value": "pratham"}'
 ```
-
 ```json
 { "status": "OK", "message": "Stored successfully." }
 ```
 
----
-
-### `GET /get?key=...` — Retrieve a value
-
+### `GET /get?key=...`
 ```bash
 curl http://localhost:7171/get?key=username
 ```
-
 ```json
 { "status": "OK", "key": "username", "value": "pratham" }
 ```
 
----
-
-### `DELETE /delete?key=...` — Delete a key
-
+### `DELETE /delete?key=...`
 ```bash
 curl -X DELETE http://localhost:7171/delete?key=username
 ```
-
 ```json
 { "status": "OK", "message": "Key 'username' deleted." }
 ```
 
----
-
-### `GET /stats` — Cache statistics
-
+### `GET /stats`
 ```bash
 curl http://localhost:7171/stats
 ```
-
 ```json
 {
   "total_items": 42,
-  "max_capacity": 1000,
-  "used_percent": 4.2,
-  "hits": 381,
-  "misses": 19,
-  "evictions": 0,
-  "hit_rate_pct": 95.25
+  "total_capacity": 11200000,
+  "num_shards": 16,
+  "used_percent": 0.0,
+  "shard_sizes": [3, 2, 4, 1, 3, 2, 4, 5, 2, 3, 2, 1, 4, 2, 3, 1]
 }
 ```
 
----
-
-### `GET /health` — Liveness check
-
+### `GET /health`
 ```bash
 curl http://localhost:7171/health
 ```
-
 ```json
 { "status": "healthy" }
 ```
@@ -151,98 +128,83 @@ curl http://localhost:7171/health
 
 ## Configuration
 
-All settings can be overridden via environment variables — no code changes needed.
+| Variable          | Default     | Description                          |
+|-------------------|-------------|--------------------------------------|
+| `NUM_SHARDS`      | `16`        | Number of shards (must be power of 2)|
+| `MAX_SHARD_SIZE`  | `700000`    | Max keys per shard                   |
+| `MAX_KV_SIZE`     | `256`       | Max length of key or value           |
+| `PORT`            | `7171`      | Server port                          |
+| `HOST`            | `127.0.0.1` | Host address                         |
 
-| Variable        | Default | Description                        |
-|-----------------|---------|------------------------------------|
-| `MAX_CACHE_SIZE` | `1000`  | Max number of keys in cache        |
-| `MAX_KV_SIZE`    | `256`   | Max length of any key or value     |
-| `PORT`           | `7171`  | Port the server listens on         |
-| `HOST`           | `0.0.0.0` | Host address                     |
-
-Example — run with custom config:
 ```bash
-MAX_CACHE_SIZE=500 PORT=8080 python server.py
+NUM_SHARDS=8 MAX_SHARD_SIZE=1000 python server.py
 ```
+
+---
+
+## How It Works
+
+```
+HTTP Request
+     │
+     ▼
+Input Validation (Pydantic)
+     │
+     ▼
+DJB2 Hash(key) & mask  ──→  Shard Index (0–15)
+     │
+     ▼
+CacheShard._lock (RWLock)
+  ├── GET  → read lock  → multiple threads parallel
+  └── PUT  → write lock → exclusive, others wait
+     │
+     ▼
+Python dict (key → value)
+  └── Full? → evict oldest key (FIFO)
+     │
+     ▼
+HTTP Response
+```
+
+**Why sharding?**
+Single cache = one lock = all threads queue up. With 16 shards, keys spread across 16 independent dicts — each with its own lock. Two threads touching different shards run fully in parallel.
+
+**Why RWLock over threading.Lock()?**
+Cache reads (GET) vastly outnumber writes (PUT). A normal lock blocks all readers even when no write is happening. RWLock allows concurrent reads — only writes require exclusivity.
+
+**Why power-of-2 shards?**
+`hash & (n-1)` is a bitwise AND — significantly faster than `hash % n`. Only works when n is a power of 2.
 
 ---
 
 ## Running Tests
 
-Make sure the server is running first, then:
-
 ```bash
-python test_server.py
+# Terminal 1
+python server.py
+
+# Terminal 2
+python test_server.py   # functional tests
+python metrics.py       # latency benchmark
 ```
-
-Expected output:
-```
-==================================================
-  In-Memory KV Cache — Test Suite
-==================================================
-
-[1] Health Check
-  ✓ PASS  |  Status code 200
-  ✓ PASS  |  Returns healthy
-
-[2] PUT then GET
-  ✓ PASS  |  PUT returns 200
-  ✓ PASS  |  GET returns 200
-  ✓ PASS  |  Value sahi mila
-...
-```
-
----
-
-## How It Works — Internals
-
-```
-HTTP Request (FastAPI)
-        │
-        ▼
-  Input Validation (Pydantic)
-        │
-        ▼
-  threading.Lock() ──── acquired
-        │
-        ▼
-  Python dict  ←─── actual storage
-  (key → value)
-        │
-   Is cache full?
-   YES → evict oldest key (FIFO)
-   NO  → store directly
-        │
-        ▼
-  Lock released ──── other threads can proceed
-        │
-        ▼
-  HTTP Response
-```
-
-**Why `threading.Lock()`?**
-FastAPI handles multiple requests concurrently. Without a lock, two requests could modify the dict at the same time and corrupt data. The lock ensures only one thread touches the dict at a time.
-
-**Why FIFO eviction?**
-When cache hits capacity, the oldest inserted key is removed. Simple and predictable. Production systems use LRU (Least Recently Used) — evicting the key that hasn't been accessed the longest — which is more cache-efficient but more complex to implement.
 
 ---
 
 ## Tech Stack
 
-| Technology | Purpose |
-|------------|---------|
-| **Python 3.12** | Core language |
-| **FastAPI** | HTTP API framework |
-| **Pydantic** | Request validation |
-| **Uvicorn** | ASGI server (runs FastAPI) |
-| **Docker** | Containerization |
+| Technology  | Purpose               |
+|-------------|-----------------------|
+| Python 3.12 | Core language         |
+| FastAPI     | HTTP API framework    |
+| Pydantic    | Request validation    |
+| Uvicorn     | ASGI server           |
+| Docker      | Containerization      |
 
 ---
 
 ## Future Improvements
 
 - **TTL (Time-To-Live)** — keys expire automatically after N seconds
-- **LRU Eviction** — smarter eviction based on access recency
-- **Persistence** — save cache to disk so data survives restarts
-- **Sharding** — split cache across multiple nodes for horizontal scaling
+- **LRU Eviction** — evict least recently used key instead of oldest inserted
+- **Persistence** — snapshot cache to disk for restart recovery
+- **Consistent Hashing** — for distributed multi-node cache clusters
