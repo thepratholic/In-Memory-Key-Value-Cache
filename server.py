@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 MAX_CACHE_SIZE = int(os.getenv("MAX_CACHE_SIZE", "1000"))   # kitne keys max
 MAX_KV_SIZE    = int(os.getenv("MAX_KV_SIZE", "256"))       # key/value max length
 PORT           = int(os.getenv("PORT", "7171"))
-HOST           = os.getenv("HOST", "0.0.0.0")
+HOST = os.getenv("HOST", "127.0.0.1")  # 0.0.0.0 tha, yeh karo
 
 
 # ─── Logging setup ─────────────────────────────────────────────────────────────
