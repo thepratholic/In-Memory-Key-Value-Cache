@@ -3,26 +3,17 @@ CacheShard
 ==========
 Cache ka ek shard — ek independent unit.
 
-Total cache = N CacheShard objects.
-Har shard:
-  - apna OrderedDict rakhta hai (actual storage + recency order)
-  - apna RWLock rakhta hai (independent locking)
-
-Benefit: Jab key_1 shard_3 mein hai aur key_2 shard_7 mein,
-dono operations ek saath chal sakte hain — alag alag locks!
-Single cache hoti toh ek lock sab pe wait karta.
-
-Eviction policy: LRU (Least Recently Used)
-  - OrderedDict apna insertion/access order maintain karta hai
-  - move_to_end(key) se koi bhi key O(1) mein "most recent" ban jaati hai
-  - popitem(last=False) se sabse "purani" (least recently used) key nikalti hai
-  - Trade-off: get() ab order modify karta hai, isliye write() lock leta hai
-    read() ki jagah — parallel-read benefit yahan LRU ki correctness ke
-    liye trade off kiya gaya hai.
+Eviction policy: CLOCK (Second-Chance Approximate LRU)
+  - Fixed-size circular array of slots (jaise ek ghadi ka face)
+  - Har slot ke saath ek reference bit — "recently accessed?"
+  - GET sirf apne reference bit ko True karta hai (lightweight,
+    read-lock ke andar safe — GIL ki wajah se atomic assignment hai)
+  - PUT (eviction ke time) "hand" circularly ghumti hai, jis slot
+    ka reference bit False mile, wahi evict hoti hai; True mile to
+    second chance dekar (bit ko False karke) aage badh jaati hai
 """
 
 import logging
-from collections import OrderedDict
 from typing import Optional
 
 from cache.rwlock import RWLock
@@ -31,66 +22,93 @@ log = logging.getLogger("kvcache")
 
 
 class CacheShard:
-    __slots__ = ("_items", "_count", "_max", "_lock")
-    # __slots__ memory optimization hai — dict ke bajaye fixed attributes
+    __slots__ = (
+        "_slots", "_values", "_ref_bits", "_key_to_slot",
+        "_free_slots", "_hand", "_count", "_max", "_lock",
+    )
 
     def __init__(self, max_items: int) -> None:
-        self._items: OrderedDict[str, str] = OrderedDict()  # storage + recency order
-        self._count: int = 0               # kitne items hain (len() se fast)
-        self._max: int = max_items         # max capacity
-        self._lock = RWLock()              # is shard ka apna lock
+        self._max = max_items
+        self._slots: list = [None] * max_items   # clock face — slot -> key
+        self._values: dict = {}                    # key -> value
+        self._ref_bits: dict = {}                   # key -> bool
+        self._key_to_slot: dict = {}                # key -> slot index
+        self._free_slots: list = list(range(max_items - 1, -1, -1))  # stack of empty slots
+        self._hand: int = 0                         # clock hand position
+        self._count: int = 0
+        self._lock = RWLock()
 
     def put(self, key: str, value: str) -> None:
-        """
-        Key-value store karo is shard mein.
-        Existing key ho to use "most recently used" bana do.
-        Full hone par LRU eviction — sabse kam-recently-used key hata do.
-        """
         with self._lock.write():
-            if key in self._items:
-                # Existing key update ho rahi hai — isse "fresh" mark karo
-                self._items.move_to_end(key)
-                self._items[key] = value
+            # Case 1: existing key — sirf value update, "fresh" mark karo
+            if key in self._values:
+                self._values[key] = value
+                self._ref_bits[key] = True
                 return
 
-            if self._count >= self._max:
-                # Shard full — sabse least-recently-used key nikalo
-                # popitem(last=False) -> OrderedDict ka pehla (sabse purana) item, O(1)
-                evict_key, _ = self._items.popitem(last=False)
-                self._count -= 1
-                log.debug("Shard full — evicted key '%s' (LRU)", evict_key)
+            # Case 2: khaali slot available hai — seedha bhar do
+            if self._free_slots:
+                idx = self._free_slots.pop()
+                self._slots[idx] = key
+                self._key_to_slot[key] = idx
+                self._values[key] = value
+                self._ref_bits[key] = True
+                self._count += 1
+                return
 
-            self._items[key] = value
-            self._count += 1
+            # Case 3: shard full — clock hand se eviction dhundo
+            while True:
+                idx = self._hand
+                candidate_key = self._slots[idx]
+
+                if self._ref_bits[candidate_key]:
+                    # Second chance do — recently used tha
+                    self._ref_bits[candidate_key] = False
+                    self._hand = (self._hand + 1) % self._max
+                else:
+                    # Evict karo — yeh victim hai
+                    del self._values[candidate_key]
+                    del self._ref_bits[candidate_key]
+                    del self._key_to_slot[candidate_key]
+
+                    self._slots[idx] = key
+                    self._key_to_slot[key] = idx
+                    self._values[key] = value
+                    self._ref_bits[key] = True
+
+                    self._hand = (self._hand + 1) % self._max
+                    log.debug("Shard full — CLOCK evicted key '%s'", candidate_key)
+                    return
 
     def get(self, key: str) -> Optional[str]:
-        """
-        Value padho — access hote hi key ko "most recently used" mark karo.
-        NOTE: order modify hota hai, isliye write() lock lena padta hai,
-        read() nahi — yeh LRU ka trade-off hai.
-        """
-        with self._lock.write():
-            if key not in self._items:
+        # Lightweight write hai (sirf ek bool flag), but pure "read"
+        # semantics chahiye — RWLock ke read() se kaam chal jaata hai
+        # kyunki dict assignment GIL ki wajah se atomic hai.
+        with self._lock.read():
+            if key not in self._values:
                 return None
-            self._items.move_to_end(key)   # is key ko "fresh" bana do
-            return self._items[key]
+            self._ref_bits[key] = True
+            return self._values[key]
 
     def delete(self, key: str) -> bool:
-        """Key hata do — True agar mila, False agar nahi tha."""
         with self._lock.write():
-            if key in self._items:
-                del self._items[key]
-                self._count -= 1
-                return True
-            return False
+            if key not in self._values:
+                return False
+
+            idx = self._key_to_slot[key]
+            del self._values[key]
+            del self._ref_bits[key]
+            del self._key_to_slot[key]
+            self._slots[idx] = None
+            self._free_slots.append(idx)
+            self._count -= 1
+            return True
 
     @property
     def size(self) -> int:
-        """Shard mein kitne items hain."""
         with self._lock.read():
             return self._count
 
     @property
     def max_items(self) -> int:
-        """Shard ki max capacity."""
         return self._max
