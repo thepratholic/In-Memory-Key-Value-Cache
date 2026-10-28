@@ -83,7 +83,7 @@ async def get(key: str = Query(..., min_length=1, max_length=MAX_KEY_VALUE_SIZE)
         return JSONResponse(
             status_code=404,
             content={"status": "ERROR", "message": f"Key '{key}' not found."},
-        )
+        )  
     return {"status": "OK", "key": key, "value": value}
 
 

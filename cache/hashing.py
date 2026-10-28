@@ -21,4 +21,4 @@ def djb2_hash(s: str) -> int:
     h = 5381
     for ch in s.encode():
         h = ((h << 5) + h + ch) & 0xFFFF_FFFF_FFFF_FFFF
-    return h
+    return h  
